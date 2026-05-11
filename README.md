@@ -1,4 +1,4 @@
-# XIAO nRF52840 Sense IMU Data Logger
+# Pet activity tracker based on XIAO nRF52840 Sense
 
 A CircuitPython application for the Seeed Studio XIAO nRF52840 Sense that continuously logs 6-axis IMU data (accelerometer + gyroscope) with BLE UART interface, motion-triggered sleep/wake, and battery monitoring.
 
