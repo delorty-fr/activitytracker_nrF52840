@@ -27,22 +27,6 @@ from adafruit_lsm6ds import Rate, AccelRange, GyroRange
 from adafruit_lsm6ds.lsm6ds3trc import LSM6DS3TRC
 from seeed_xiao_nrf52840 import Battery
 
-# --- Constants ---
-DEBUG = True                        # Set to True to enable print statements
-
-RECORDING_FREQUENCY         = 5     # Hz. Rate to sample IMU data.
-AUTO_SAVE_RECORDS_INTERVAL  = 10000 # Save to file every N records.
-
-BINARY_FILE           = "imu_data.bin"  # Binary file for optimized storage (not human-readable)
-CSV_FILE              = "imu_data.csv"  # File to store recorded data.
-MIN_DISK_BUFFER_BYTES = 1024 * 5        # Min free disk space to keep
-
-SAVE_TO_TXT           = False           # Set to True to enable file saving, False to keep data in RAM only
-SAVE_TO_BIN           = False           # Set to True to save in compact binary format instead of CSV (not human-readable)
-
-BATTERY_SAFETY_THRESHOLD = 3.5          # Batterry voltage threshold to consider the device safe to operate
-
-# --- SENSITIVITY LEVELS ---
 
 # LSM6DS3TR-C Wake-up Threshold Levels (Register 0x5B)
 # Register 0x5B uses 6 bits for the threshold.
@@ -65,8 +49,6 @@ IMU_SENSITIVITY_LEVELS = [
     IMU_SENSITIVITY_LEVEL_6
 ]
 
-IMU_DEFAULT_SENSITIVITY = IMU_SENSITIVITY_LEVEL_1  # Default sensitivity for general motion detection
-
 # --- IMU FREQUENCY LEVELS ---
 # Always keep the IMU hardware frequency at least 2x to 4x faster than your code's sampling frequency.
 IMU_FREQUENCY_LEVEL_1 = 0x10  # 12.5 Hz (Lowest power; slow response)
@@ -82,15 +64,22 @@ IMU_FREQUENCY_LEVELS = [
     IMU_FREQUENCY_LEVEL_5
 ]
 
-IMU_DEFAULT_FREQUENCY = IMU_FREQUENCY_LEVEL_3  # Default frequency for wake-up detection
+# --- Config ---
+DEBUG = True                                            # Set to True to enable print statements
 
-# --- SLEEP CONFIGURATION ---
-WAKEUP_REQUIRED_HITS    = 10     # 'n' values: Number of triggers needed to fully wake up
-WAKEUP_WINDOW_SECONDS   = 10.0   # Period to detect those 'n' hits
-WAKEUP_IMU_SENSITIVITY  = IMU_SENSITIVITY_LEVEL_4   # Sensitivity level for wake-up detection
+RECORDING_FREQUENCY         = 10                        # Hz. Rate to sample IMU data.
+AUTO_SAVE_RECORDS_INTERVAL  = 10000                     # Save to file every N records.
+BINARY_FILE                 = "imu_data.bin"            # Binary file for optimized storage (not human-readable)
+SAVE_TO_DISK                = False                     # Set to True to save records to disk
+IMU_DEFAULT_SENSITIVITY     = IMU_SENSITIVITY_LEVEL_1   # Default sensitivity for general motion detection
+IMU_DEFAULT_FREQUENCY       = IMU_FREQUENCY_LEVEL_3     # Default frequency for wake-up detection
+WAKEUP_REQUIRED_HITS        = 10                        # 'n' values: Number of triggers needed to fully wake up
+WAKEUP_WINDOW_SECONDS       = 10.0                      # Period to detect those 'n' hits
+WAKEUP_IMU_SENSITIVITY      = IMU_SENSITIVITY_LEVEL_4   # Sensitivity level for wake-up detection
+IMU_SLEEP_FREQUENCY         = IMU_FREQUENCY_LEVEL_2     # Lower frequency during sleep to save power
 
-IMU_SLEEP_FREQUENCY   = IMU_FREQUENCY_LEVEL_2  # Lower frequency during sleep to save power
-
+BATTERY_SAFETY_THRESHOLD    = 3.5                       # Batterry voltage threshold to consider the device safe to operate
+MIN_DISK_BUFFER_BYTES       = 1024 * 5                  # Min free disk space to keep
 # --- LEDS ---
 # LED logic is inverted on this board (True = off, False = on)
 LED_RED     = digitalio.DigitalInOut(board.LED_RED)
@@ -129,6 +118,7 @@ current_wakeup_sensitivity      = WAKEUP_IMU_SENSITIVITY    # Track current wake
 current_recording_frequency     = RECORDING_FREQUENCY       # Track current recording frequency in Hz
 current_imu_frequency_level     = IMU_DEFAULT_FREQUENCY     # Track current IMU frequency level
 current_imu_sensitivity_level   = IMU_DEFAULT_SENSITIVITY   # Track current IMU sensitivity level
+last_imu_text                   = ""                        # Last IMU reading as text for broadcasting
 
 # --- Functions ---
 
@@ -336,9 +326,9 @@ def get_status_info():
         current_time[3], current_time[4], current_time[5]
     )
     
-    # Get data file size safely (CircuitPython doesn't have os.path.exists)
+    # Get binary file size safely
     try:
-        stat_result = os.stat(CSV_FILE)
+        stat_result = os.stat(BINARY_FILE)
         file_size = stat_result[6]  # Index 6 is file size in CircuitPython tuple
     except OSError:
         file_size = 0
@@ -422,12 +412,11 @@ def has_enough_space_for_record(data_length_bytes):
     return True
 
 def clear_datafile():
-    """Clear data file by opening in write mode (truncates automatically)."""
+    """Clear binary data file by truncating."""
     try:
-        with open(CSV_FILE, 'w') as f:
-            f.write("# IMU Data Logger (Magnitude Mode)\n")
-            f.write("timestamp,accel_magnitude,gyro_magnitude\n")
-        DEBUG and print(f"Cleared and reset data file: {CSV_FILE}")
+        with open(BINARY_FILE, 'wb') as f:
+            pass  # Opening in write mode truncates the file
+        DEBUG and print(f"Cleared binary data file: {BINARY_FILE}")
         return True
     except OSError as e:
         DEBUG and print(f"Error clearing data file: {e}")
@@ -470,7 +459,7 @@ def read_binary_records(binary_file):
         return []
 
 
-def save_to_binfile(records, binary_file):
+def SAVE_TO_DISKfile(records, binary_file):
     """
     Save records to optimized binary format for compact storage.
     Binary format: each record is 12 bytes (3 x float32)
@@ -481,7 +470,7 @@ def save_to_binfile(records, binary_file):
     This reduces storage from ~50 bytes/record (CSV) to 12 bytes/record (~75% reduction).
     
     Args:
-        records (list): List of CSV records as strings (e.g., "123.45,1.23,2.34\n")
+        records (list): List of binary records as bytes (12 bytes each)
         binary_file (str): Path to binary output file
     
     Returns:
@@ -504,23 +493,18 @@ def save_to_binfile(records, binary_file):
         
         # Open binary file in append mode
         with open(binary_file, "ab") as f:
-            for line in records:
+            for binary_data in records:
                 try:
-                    # Parse CSV line: "timestamp,accel_mag,gyro_mag\n"
-                    parts = line.strip().split(',')
-                    if len(parts) >= 3:
-                        timestamp = float(parts[0])
-                        accel_mag = float(parts[1])
-                        gyro_mag = float(parts[2])
-                        
-                        # Pack as 3 floats (12 bytes total)
-                        binary_data = struct.pack('<fff', timestamp, accel_mag, gyro_mag)
+                    # Records are already binary (12 bytes each)
+                    if isinstance(binary_data, bytes) and len(binary_data) == 12:
                         f.write(binary_data)
-                except (ValueError, IndexError) as e:
-                    DEBUG and print(f"Error parsing record '{line.strip()}': {e}")
+                    else:
+                        DEBUG and print(f"Error: Invalid record format (expected 12-byte binary, got {len(binary_data)} bytes)")
+                except Exception as e:
+                    DEBUG and print(f"Error writing binary record: {e}")
                     continue
         
-        DEBUG and print(f"Saved {len(records)} records to {binary_file} ({binary_size} bytes)")
+        DEBUG and print(f"Saved {len(records)} binary records to {binary_file} ({binary_size} bytes)")
         return True
         
     except OSError as e:
@@ -531,73 +515,7 @@ def save_to_binfile(records, binary_file):
         return False
 
 
-def save_to_textfile(records, CSV_FILE):
-    """
-    Save records to CSV file. Creates file with header if needed.
-    
-    Args:
-        records (list): List of records to be saved.
-    
-    Returns:
-        bool: True if records were saved successfully, False otherwise.
-    """
-    if not records or not save_to_textfile:
-        if not is_battery_safe():
-            DEBUG and print("Battery voltage too low for safe file writing.")
-            blink_led(LED_RED, 3, 0.1)  # Indicate low battery with red LED
-        return False
-    
-    try:
-        # Calculate actual size of records to be written
-        estimated_size = sum(len(line.encode()) for line in records)
-        
-        # Check if we have enough space including buffer
-        if not has_enough_space_for_record(estimated_size):
-            DEBUG and print(f"Warning: Insufficient disk space. Flushing file to free space...")
-            
-            # Try to delete the file to free up space
-            try:
-                os.remove(CSV_FILE)
-                DEBUG and print(f"Deleted {CSV_FILE} to free space")
-            except OSError:
-                pass  # File might not exist
-            
-            # Re-check available space after flush
-            if not has_enough_space_for_record(estimated_size):
-                DEBUG and print(f"Error: Still insufficient space even after flush. Available: {get_free_space_bytes()} bytes, "
-                          f"Required: {estimated_size + MIN_DISK_BUFFER_BYTES} bytes")
-                return False
-        
-        file_exists = False
-        try:
-            os.stat(CSV_FILE)
-            file_exists = True
-        except OSError:
-            file_exists = False
-        
-        # Open in append mode, or create if doesn't exist
-        with open(CSV_FILE, "a") as f:
-            # Write header if new file
-            if not file_exists:
-                f.write("# IMU Data Logger (Magnitude Mode)\n")
-                f.write("timestamp,accel_magnitude,gyro_magnitude\n")
-            
-            # Write all records
-            for line in records:
-                f.write(line)
-
-            # Force data out of the buffer and into the file immediately (important for power management)
-            f.flush() 
-        
-        DEBUG and print(f"Saved {len(records)} records to {CSV_FILE}")
-        return True
-    except OSError as e:
-        # Check if it's a read-only filesystem error
-        if e.errno == 30:  # EROFS - Read-only file system
-            DEBUG and print(f"Warning: Filesystem is read-only. Data kept in RAM only. Error: {e}")
-        else:
-            DEBUG and print(f"Error saving to file: {e}")
-        return False
+# CSV support has been removed - all data is stored in binary format
 
 def set_time(cmd):
     """
@@ -676,26 +594,26 @@ def handle_ble_commands():
 
 
 def handle_ble_cmd_data():
-    """ Send all data from file via BLE """
+    """ Send all data from binary file via BLE in text format """
     response = f"--- start\r\n"
     uart_server.write(response.encode())
     try:
-        with open(CSV_FILE, 'r') as f:
-            for line in f:
-                uart_server.write(line.encode())
-                time.sleep(0.01)  # Small delay between records
+        records = read_binary_records(BINARY_FILE)
+        for line in records:
+            uart_server.write(line.encode())
+            time.sleep(0.01)  # Small delay between records
         response = f"--- end\r\n"
     except OSError as e:
         response = f"Error reading file: {e}\r\n"
     return response
 
 def handle_ble_cmd_save_buff():
-    """ Save unsaved records before clearing """
+    """ Save unsaved records to binary file before clearing """
     response = False
     try:
         if unsaved_records:
-            print(f"Saving {len(unsaved_records)} records before clear...")
-            save_to_disk(unsaved_records)
+            print(f"Saving {len(unsaved_records)} binary records before clear...")
+            SAVE_TO_DISKfile(unsaved_records, BINARY_FILE)
             response = True
             unsaved_records.clear()
     except Exception as e:
@@ -802,17 +720,6 @@ def handle_ble_cmd_set_recording_freq(freq_ref):
         response = f"Recording frequency set to default ({RECORDING_FREQUENCY} Hz)\r\n"
     return response
 
-def save_to_disk(records):
-    """Helper to save records to disk, trying binary first if enabled."""
-    success = True
-    if SAVE_TO_BIN:
-        success = success and save_to_binfile(records, BINARY_FILE)
-    if SAVE_TO_TXT:
-        success = success and save_to_textfile(records, CSV_FILE)
-    else:
-        DEBUG and print("No saving method enabled. Data kept in RAM only.")
-        return False
-    return success
 
 # --- Main Logic ---
 # Simple continuous recording with BLE control
@@ -825,7 +732,7 @@ else:
     DEBUG and print("Cold boot or power-on")
 
 # Initialize globals
-unsaved_records = []  # Tracks records not yet saved to file
+unsaved_records = []  # Tracks binary records (12 bytes each) not yet saved to file
 iteration_count = 0  # Counter for BLE updates
 ble_was_connected = False  # Track BLE connection state
 advertisement = ProvideServicesAdvertisement(uart_server)
@@ -865,20 +772,28 @@ while True:
     try:
         imu_data = read_imu()
 
-        line = "{:.2f},{:.2f},{:.2f}\n".format(
+        # Format text for broadcasting and logging
+        last_imu_text = "{:.2f},{:.2f},{:.2f}\n".format(
             time.monotonic(),
             imu_data["accel_mag"],
             imu_data["gyro_mag"]
         )
-        unsaved_records.append(line)
-        DEBUG and print(f"Recorded: {line.strip()}")
         
-        uart_server.write(line.strip().encode())
+        # Store as binary (12 bytes: 3 × float32)
+        parts = last_imu_text.strip().split(',')
+        timestamp = float(parts[0])
+        accel_mag = float(parts[1])
+        gyro_mag = float(parts[2])
+        binary_data = struct.pack('<fff', timestamp, accel_mag, gyro_mag)
+        unsaved_records.append(binary_data)
+        
+        DEBUG and print(f"Recorded: {last_imu_text.strip()}")
+        uart_server.write(last_imu_text.strip().encode())
 
-        # Auto-save to file every N records
+        # Auto-save to binary file every N records
         if len(unsaved_records) >= AUTO_SAVE_RECORDS_INTERVAL:
-            DEBUG and print(f"Auto-saving records to file...")
-            if save_to_disk(unsaved_records):
+            DEBUG and print(f"Auto-saving {len(unsaved_records)} records to binary file...")
+            if SAVE_TO_DISKfile(unsaved_records, BINARY_FILE):
                 # Successfully saved, clear buffer
                 unsaved_records.clear()
 
@@ -887,7 +802,7 @@ while True:
             # If memory allocation error, try to save what we have and clear buffer
             DEBUG and print(f"MemoryError: Attempting to save unsaved records before clearing buffer...")
             try:
-                save_to_disk(unsaved_records)
+                SAVE_TO_DISKfile(unsaved_records, BINARY_FILE)
             except Exception as save_e:
                 DEBUG and print(f"Error saving to disk during MemoryError handling: {save_e}")
             # Flush the buffer no matter what
