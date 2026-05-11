@@ -33,9 +33,14 @@ DEBUG = True                        # Set to True to enable print statements
 RECORDING_FREQUENCY         = 5     # Hz. Rate to sample IMU data.
 AUTO_SAVE_RECORDS_INTERVAL  = 10000 # Save to file every N records.
 
-DATA_FILE             = "imu_data.csv"  # File to store recorded data.
+BINARY_FILE           = "imu_data.bin"  # Binary file for optimized storage (not human-readable)
+CSV_FILE              = "imu_data.csv"  # File to store recorded data.
 MIN_DISK_BUFFER_BYTES = 1024 * 5        # Min free disk space to keep
-SAVE_TO_FILE          = False           # Set to True to enable file saving, False to keep data in RAM only
+
+SAVE_TO_TXT           = False           # Set to True to enable file saving, False to keep data in RAM only
+SAVE_TO_BIN           = False           # Set to True to save in compact binary format instead of CSV (not human-readable)
+
+BATTERY_SAFETY_THRESHOLD = 3.5          # Batterry voltage threshold to consider the device safe to operate
 
 # --- SENSITIVITY LEVELS ---
 
@@ -60,7 +65,7 @@ IMU_SENSITIVITY_LEVELS = [
     IMU_SENSITIVITY_LEVEL_6
 ]
 
-IMU_DEFAULT_SENSITIVITY = IMU_SENSITIVITY_LEVEL_2  # Default sensitivity for general motion detection
+IMU_DEFAULT_SENSITIVITY = IMU_SENSITIVITY_LEVEL_1  # Default sensitivity for general motion detection
 
 # --- IMU FREQUENCY LEVELS ---
 # Always keep the IMU hardware frequency at least 2x to 4x faster than your code's sampling frequency.
@@ -119,20 +124,20 @@ sensor          = LSM6DS3TRC(imu_i2c)
 
 ble = BLERadio()
 uart_server = UARTService()
-current_wakeup_sensitivity = WAKEUP_IMU_SENSITIVITY  # Track current wake-up sensitivity level
-current_recording_frequency = RECORDING_FREQUENCY    # Track current recording frequency in Hz
+
+current_wakeup_sensitivity      = WAKEUP_IMU_SENSITIVITY    # Track current wake-up sensitivity level
+current_recording_frequency     = RECORDING_FREQUENCY       # Track current recording frequency in Hz
+current_imu_frequency_level     = IMU_DEFAULT_FREQUENCY     # Track current IMU frequency level
+current_imu_sensitivity_level   = IMU_DEFAULT_SENSITIVITY   # Track current IMU sensitivity level
 
 # --- Functions ---
 
 def write_reg(register, value):
     """Helper to write to LSM6DS3TR-C registers (Default Address 0x6A)"""
-    try:
-        while not imu_i2c.try_lock():
-            pass
-        imu_i2c.writeto(0x6A, bytes([register, value]))
-        imu_i2c.unlock()
-    except Exception as e:
-        DEBUG and print(f"Error writing register 0x{register:02X}: {e}")
+    while not imu_i2c.try_lock():
+        pass
+    imu_i2c.writeto(0x6A, bytes([register, value]))
+    imu_i2c.unlock()
 
 def read_reg(reg):
     """Reads a single byte from a specific register."""
@@ -192,7 +197,7 @@ def blink_led(led, num_blinks, delay=0.2):
     except Exception as e:
         DEBUG and print(f"Error blinking LED: {e}")
 
-def configure_wakeup_motion_detection(sensitivity_level=WAKEUP_IMU_SENSITIVITY, frequency_level=IMU_SLEEP_FREQUENCY):
+def set_imu_wakeup_motion_detection(sensitivity_level=WAKEUP_IMU_SENSITIVITY, frequency_level=IMU_SLEEP_FREQUENCY):
     """
     Configure LSM6DS3TR-C hardware wake-up engine via direct register writes.
     This allows motion detection even in deep sleep mode.
@@ -241,7 +246,7 @@ def clear_imu_interrupt():
 
 def enter_sleep_mode():
     """Puts the device into light sleep mode and configures wake-up on motion detection."""
-    configure_wakeup_motion_detection(sensitivity_level=current_wakeup_sensitivity)
+    set_imu_wakeup_motion_detection(sensitivity_level=current_wakeup_sensitivity)
     while True:
         hits = 0
         start_time = None
@@ -251,12 +256,15 @@ def enter_sleep_mode():
         while hits < WAKEUP_REQUIRED_HITS:
             # 1. Clear latch so the pin can transition again
             clear_imu_interrupt()
+
+            # 2. Power off flash to save energy during sleep
+            poweroff_flash()
             
-            # 2. Sleep until the NEXT motion event
+            # 3. Sleep until the NEXT motion event
             motion_alarm = alarm.pin.PinAlarm(pin=board.IMU_INT1, value=True)
             alarm.light_sleep_until_alarms(motion_alarm)
             
-            # 3. Handle the hit
+            # 4. Handle the hit
             now = time.monotonic()
             if hits == 0:
                 # This is the first hit, start the timer window
@@ -279,8 +287,8 @@ def enter_sleep_mode():
         DEBUG and blink_led(LED_BLUE, 3, 0.1)  # Indicate wake-up with LED pattern
         
         clear_imu_interrupt()
-        set_imu_frequency(IMU_DEFAULT_FREQUENCY)        # Restore normal frequency
-        set_imu_sensitivity(IMU_DEFAULT_SENSITIVITY)    # Restore normal sensitivity
+        set_imu_frequency(current_imu_frequency_level)        # Restore normal frequency
+        set_imu_sensitivity(current_imu_sensitivity_level)    # Restore normal sensitivity
 
         break # Fully wake up and continue code.py
    
@@ -330,7 +338,7 @@ def get_status_info():
     
     # Get data file size safely (CircuitPython doesn't have os.path.exists)
     try:
-        stat_result = os.stat(DATA_FILE)
+        stat_result = os.stat(CSV_FILE)
         file_size = stat_result[6]  # Index 6 is file size in CircuitPython tuple
     except OSError:
         file_size = 0
@@ -377,13 +385,6 @@ def read_imu_status():
     # 3. Wake-up Sensitivity (Register 0x5B)
     wake_sens = reg_5B & 0x3F # Mask to 6 bits
 
-    if DEBUG:
-        print(f"--- IMU STATUS ---")
-        print(f"Frequency Reg (0x10): {reg_10:#04x} (Level {freq_val})")
-        print(f"General Sensitivity:  {current_scale}")
-        print(f"Wake-up Threshold:    {wake_sens} ({reg_5B:#04x})")
-        print(f"------------------\n")
-
     return {
         "frequency_bits": freq_val,
         "sensitivity_bits": scale_bits,
@@ -400,7 +401,7 @@ def is_battery_safe():
     try:
         with Battery() as bat:
                 voltage = bat.voltage
-                return voltage > 3.5
+                return voltage > BATTERY_SAFETY_THRESHOLD
     except Exception as e:
         DEBUG and print(f"Error reading battery: {e}")
         return False
@@ -423,16 +424,114 @@ def has_enough_space_for_record(data_length_bytes):
 def clear_datafile():
     """Clear data file by opening in write mode (truncates automatically)."""
     try:
-        with open(DATA_FILE, 'w') as f:
+        with open(CSV_FILE, 'w') as f:
             f.write("# IMU Data Logger (Magnitude Mode)\n")
             f.write("timestamp,accel_magnitude,gyro_magnitude\n")
-        DEBUG and print(f"Cleared and reset data file: {DATA_FILE}")
+        DEBUG and print(f"Cleared and reset data file: {CSV_FILE}")
         return True
     except OSError as e:
         DEBUG and print(f"Error clearing data file: {e}")
         return False
 
-def save_to_file(records):
+def read_binary_records(binary_file):
+    """
+    Read records from optimized binary format and return as CSV-like strings.
+    Binary format: each record is 12 bytes (3 x float32)
+      - Bytes 0-3:   timestamp (float)
+      - Bytes 4-7:   accel_magnitude (float)
+      - Bytes 8-11:  gyro_magnitude (float)
+    
+    Args:
+        binary_file (str): Path to binary file to read
+    
+    Returns:
+        list: List of CSV-formatted records, or empty list if file doesn't exist
+    """
+    records = []
+    try:
+        with open(binary_file, "rb") as f:
+            while True:
+                binary_data = f.read(12)  # Read 12 bytes per record
+                if not binary_data or len(binary_data) < 12:
+                    break
+                
+                # Unpack as 3 floats
+                timestamp, accel_mag, gyro_mag = struct.unpack('<fff', binary_data)
+                
+                # Convert back to CSV format
+                csv_line = f"{timestamp:.2f},{accel_mag:.2f},{gyro_mag:.2f}\n"
+                records.append(csv_line)
+        
+        DEBUG and print(f"Read {len(records)} records from {binary_file}")
+        return records
+        
+    except OSError as e:
+        DEBUG and print(f"Error reading binary file '{binary_file}': {e}")
+        return []
+
+
+def save_to_binfile(records, binary_file):
+    """
+    Save records to optimized binary format for compact storage.
+    Binary format: each record is 12 bytes (3 x float32)
+      - Bytes 0-3:   timestamp (float)
+      - Bytes 4-7:   accel_magnitude (float)
+      - Bytes 8-11:  gyro_magnitude (float)
+    
+    This reduces storage from ~50 bytes/record (CSV) to 12 bytes/record (~75% reduction).
+    
+    Args:
+        records (list): List of CSV records as strings (e.g., "123.45,1.23,2.34\n")
+        binary_file (str): Path to binary output file
+    
+    Returns:
+        bool: True if records were saved successfully, False otherwise.
+    """
+    if not records or not is_battery_safe():
+        if not is_battery_safe():
+            DEBUG and print("Battery voltage too low for safe binary file writing.")
+            blink_led(LED_RED, 3, 0.1)
+        return False
+    
+    try:
+        # Calculate binary size: 12 bytes per record
+        binary_size = len(records) * 12
+        
+        # Check if we have enough space
+        if not has_enough_space_for_record(binary_size):
+            DEBUG and print(f"Warning: Insufficient disk space for binary save. Available: {get_free_space_bytes()} bytes")
+            return False
+        
+        # Open binary file in append mode
+        with open(binary_file, "ab") as f:
+            for line in records:
+                try:
+                    # Parse CSV line: "timestamp,accel_mag,gyro_mag\n"
+                    parts = line.strip().split(',')
+                    if len(parts) >= 3:
+                        timestamp = float(parts[0])
+                        accel_mag = float(parts[1])
+                        gyro_mag = float(parts[2])
+                        
+                        # Pack as 3 floats (12 bytes total)
+                        binary_data = struct.pack('<fff', timestamp, accel_mag, gyro_mag)
+                        f.write(binary_data)
+                except (ValueError, IndexError) as e:
+                    DEBUG and print(f"Error parsing record '{line.strip()}': {e}")
+                    continue
+        
+        DEBUG and print(f"Saved {len(records)} records to {binary_file} ({binary_size} bytes)")
+        return True
+        
+    except OSError as e:
+        if e.errno == 30:  # EROFS - Read-only file system
+            DEBUG and print(f"Warning: Filesystem is read-only. Data kept in RAM only.")
+        else:
+            DEBUG and print(f"Error saving binary file: {e}")
+        return False
+
+
+def save_to_textfile(records, CSV_FILE):
     """
     Save records to CSV file. Creates file with header if needed.
     
@@ -442,7 +541,7 @@ def save_to_file(records):
     Returns:
         bool: True if records were saved successfully, False otherwise.
     """
-    if not records or not SAVE_TO_FILE:
+    if not records or not save_to_textfile:
         if not is_battery_safe():
             DEBUG and print("Battery voltage too low for safe file writing.")
             blink_led(LED_RED, 3, 0.1)  # Indicate low battery with red LED
@@ -458,8 +557,8 @@ def save_to_file(records):
             
             # Try to delete the file to free up space
             try:
-                os.remove(DATA_FILE)
-                DEBUG and print(f"Deleted {DATA_FILE} to free space")
+                os.remove(CSV_FILE)
+                DEBUG and print(f"Deleted {CSV_FILE} to free space")
             except OSError:
                 pass  # File might not exist
             
@@ -471,13 +570,13 @@ def save_to_file(records):
         
         file_exists = False
         try:
-            os.stat(DATA_FILE)
+            os.stat(CSV_FILE)
             file_exists = True
         except OSError:
             file_exists = False
         
         # Open in append mode, or create if doesn't exist
-        with open(DATA_FILE, "a") as f:
+        with open(CSV_FILE, "a") as f:
             # Write header if new file
             if not file_exists:
                 f.write("# IMU Data Logger (Magnitude Mode)\n")
@@ -490,7 +589,7 @@ def save_to_file(records):
             # Force data out of the buffer and into the file immediately (important for power management)
             f.flush() 
         
-        DEBUG and print(f"Saved {len(records)} records to {DATA_FILE}")
+        DEBUG and print(f"Saved {len(records)} records to {CSV_FILE}")
         return True
     except OSError as e:
         # Check if it's a read-only filesystem error
@@ -545,113 +644,23 @@ def handle_ble_commands():
             
             response = ""
             if text == 'data':
-                # Send all data from file via BLE
-                response = f"--- start\r\n"
-                uart_server.write(response.encode())
-                try:
-                    with open(DATA_FILE, 'r') as f:
-                        for line in f:
-                            uart_server.write(line.encode())
-                            time.sleep(0.01)  # Small delay between records
-                    response = f"--- end\r\n"
-                except OSError as e:
-                    response = f"Error reading file: {e}\r\n"
+                response = handle_ble_cmd_data()
             elif text == 'save_buff':
-                # Save unsaved records before clearing
-                try:
-                    if unsaved_records:
-                        print(f"Saving {len(unsaved_records)} records before clear...")
-                        save_to_file(unsaved_records)
-                        response = True
-                        unsaved_records.clear()
-                except Exception as e:
-                    DEBUG and print(f"Error clearing buffer: {e}")
-                    response = f"Error clearing buffer: {e}\r\n"
+                response = handle_ble_cmd_save_buff()
             elif text == 'clear_data':
                 response = clear_datafile()
             elif text == 'sensors':
-                d = read_imu()
-                response = (
-                    f"CPU Temp: {microcontroller.cpu.temperature} oC\r\n"
-                    f"CPU Voltage: {round(microcontroller.cpu.voltage, 1)} volts\r\n"
-                    f"Accel Magnitude: {d['accel_mag']:.2f} m/s^2\r\n"
-                    f"Gyro Magnitude: {d['gyro_mag']:.2f} rad/s\r\n"
-                )
+                response = handle_ble_cmd_sensors()
             elif text == 'sleep':
                 response = enter_sleep_mode()
             elif text.startswith('set_freq'):
-                # Command: set_freq [1-5] or set_freq (defaults to IMU_DEFAULT_FREQUENCY)
-                parts = text.split()
-                if len(parts) > 1:
-                    try:
-                        level = int(parts[1])
-                        if 1 <= level <= 5:
-                            freq_levels = [IMU_FREQUENCY_LEVEL_1, IMU_FREQUENCY_LEVEL_2, IMU_FREQUENCY_LEVEL_3, IMU_FREQUENCY_LEVEL_4, IMU_FREQUENCY_LEVEL_5]
-                            set_imu_frequency(freq_levels[level - 1])
-                            response = f"IMU frequency set to level {level}\r\n"
-                        else:
-                            response = "Error: Frequency level must be 1-5\r\n"
-                    except ValueError:
-                        response = "Error: Invalid frequency level. Use: set_freq [1-5]\r\n"
-                else:
-                    # No level specified, use default
-                    set_imu_frequency(IMU_DEFAULT_FREQUENCY)
-                    response = "IMU frequency set to default (level 4)\r\n"
+                response = handle_ble_cmd_set_freq(text)
             elif text.startswith('set_sens'):
-                # Command: set_sens [0-6] or set_sens (defaults to IMU_DEFAULT_SENSITIVITY)
-                parts = text.split()
-                if len(parts) > 1:
-                    try:
-                        level = int(parts[1])
-                        if 0 <= level <= 6:
-                            sens_levels = [IMU_SENSITIVITY_LEVEL_0, IMU_SENSITIVITY_LEVEL_1, IMU_SENSITIVITY_LEVEL_2, IMU_SENSITIVITY_LEVEL_3, IMU_SENSITIVITY_LEVEL_4, IMU_SENSITIVITY_LEVEL_5, IMU_SENSITIVITY_LEVEL_6]
-                            set_imu_sensitivity(sens_levels[level])
-                            response = f"IMU sensitivity set to level {level}\r\n"
-                        else:
-                            response = "Error: Sensitivity level must be 0-6\r\n"
-                    except ValueError:
-                        response = "Error: Invalid sensitivity level. Use: set_sens [0-6]\r\n"
-                else:
-                    # No level specified, use default
-                    set_imu_sensitivity(IMU_DEFAULT_SENSITIVITY)
-                    response = "IMU sensitivity set to default (level 2)\r\n"
+                response = handle_ble_cmd_set_sens(text)
             elif text.startswith('set_wakeup_sens'):
-                # Command: set_wakeup_sens [0-6] or set_wakeup_sens (defaults to WAKEUP_IMU_SENSITIVITY)
-                global current_wakeup_sensitivity
-                parts = text.split()
-                if len(parts) > 1:
-                    try:
-                        level = int(parts[1])
-                        if 0 <= level <= 6:
-                            sens_levels = [IMU_SENSITIVITY_LEVEL_0, IMU_SENSITIVITY_LEVEL_1, IMU_SENSITIVITY_LEVEL_2, IMU_SENSITIVITY_LEVEL_3, IMU_SENSITIVITY_LEVEL_4, IMU_SENSITIVITY_LEVEL_5, IMU_SENSITIVITY_LEVEL_6]
-                            current_wakeup_sensitivity = sens_levels[level]
-                            response = f"Wake-up sensitivity set to level {level}\r\n"
-                        else:
-                            response = "Error: Sensitivity level must be 0-6\r\n"
-                    except ValueError:
-                        response = "Error: Invalid sensitivity level. Use: set_wakeup_sens [0-6]\r\n"
-                else:
-                    # No level specified, use default
-                    current_wakeup_sensitivity = WAKEUP_IMU_SENSITIVITY
-                    response = "Wake-up sensitivity set to default (level 4)\r\n"
+                response = handle_ble_cmd_set_wakeup_sens(text)
             elif text.startswith('set_recording_freq'):
-                # Command: set_recording_freq [1-10] or set_recording_freq (defaults to RECORDING_FREQUENCY)
-                global current_recording_frequency
-                parts = text.split()
-                if len(parts) > 1:
-                    try:
-                        freq = int(parts[1])
-                        if 1 <= freq <= 10:
-                            current_recording_frequency = freq
-                            response = f"Recording frequency set to {freq} Hz\r\n"
-                        else:
-                            response = "Error: Recording frequency must be 1-10 Hz\r\n"
-                    except ValueError:
-                        response = "Error: Invalid frequency. Use: set_recording_freq [1-10]\r\n"
-                else:
-                    # No frequency specified, use default
-                    current_recording_frequency = RECORDING_FREQUENCY
-                    response = f"Recording frequency set to default ({RECORDING_FREQUENCY} Hz)\r\n"
+                response = handle_ble_cmd_set_recording_freq(text)
             elif text.startswith('set_time'):
                 response = set_time(text)
             elif text == 'status':
@@ -666,9 +675,148 @@ def handle_ble_commands():
             DEBUG and print(f"Error in BLE handler: {e}")
 
 
+def handle_ble_cmd_data():
+    """ Send all data from file via BLE """
+    response = f"--- start\r\n"
+    uart_server.write(response.encode())
+    try:
+        with open(CSV_FILE, 'r') as f:
+            for line in f:
+                uart_server.write(line.encode())
+                time.sleep(0.01)  # Small delay between records
+        response = f"--- end\r\n"
+    except OSError as e:
+        response = f"Error reading file: {e}\r\n"
+    return response
+
+def handle_ble_cmd_save_buff():
+    """ Save unsaved records before clearing """
+    response = False
+    try:
+        if unsaved_records:
+            print(f"Saving {len(unsaved_records)} records before clear...")
+            save_to_disk(unsaved_records)
+            response = True
+            unsaved_records.clear()
+    except Exception as e:
+        DEBUG and print(f"Error clearing buffer: {e}")
+        response = f"Error clearing buffer: {e}\r\n"
+    return response
+
+def handle_ble_cmd_sensors():
+    """ Read and return current sensor values """
+    response = ""
+    try:
+        d = read_imu()
+        response = (
+            f"CPU Temp: {microcontroller.cpu.temperature} oC\r\n"
+            f"CPU Voltage: {round(microcontroller.cpu.voltage, 1)} volts\r\n"
+            f"Accel Magnitude: {d['accel_mag']:.2f} m/s^2\r\n"
+            f"Gyro Magnitude: {d['gyro_mag']:.2f} rad/s\r\n"
+        )
+    except Exception as e:
+        response = f"Error reading sensors: {e}\r\n"
+    return response
+
+def handle_ble_cmd_set_freq(freq_ref):
+    """ Command: set_freq [1-5] or set_freq (defaults to IMU_DEFAULT_FREQUENCY) """
+    response = ""
+    parts = freq_ref.split()
+    if len(parts) > 1:
+        try:
+            level = int(parts[1])
+            if 1 <= level <= 5:
+                freq_levels = [IMU_FREQUENCY_LEVEL_1, IMU_FREQUENCY_LEVEL_2, IMU_FREQUENCY_LEVEL_3, IMU_FREQUENCY_LEVEL_4, IMU_FREQUENCY_LEVEL_5]
+                set_imu_frequency(freq_levels[level - 1])
+                response = f"IMU frequency set to level {level}\r\n"
+            else:
+                response = "Error: Frequency level must be 1-5\r\n"
+        except ValueError:
+            response = "Error: Invalid frequency level. Use: set_freq [1-5]\r\n"
+    else:
+        # No level specified, use default
+        set_imu_frequency(IMU_DEFAULT_FREQUENCY)
+        response = "IMU frequency set to default (level 4)\r\n"
+    return response
+
+def handle_ble_cmd_set_sens(sens_ref):
+    """Command: set_sens [0-6] or set_sens (defaults to IMU_DEFAULT_SENSITIVITY) """
+    parts = sens_ref.split()
+    if len(parts) > 1:
+        try:
+            level = int(parts[1])
+            if 0 <= level <= 6:
+                sens_levels = [IMU_SENSITIVITY_LEVEL_0, IMU_SENSITIVITY_LEVEL_1, IMU_SENSITIVITY_LEVEL_2, IMU_SENSITIVITY_LEVEL_3, IMU_SENSITIVITY_LEVEL_4, IMU_SENSITIVITY_LEVEL_5, IMU_SENSITIVITY_LEVEL_6]
+                set_imu_sensitivity(sens_levels[level])
+                response = f"IMU sensitivity set to level {level}\r\n"
+            else:
+                response = "Error: Sensitivity level must be 0-6\r\n"
+        except ValueError:
+            response = "Error: Invalid sensitivity level. Use: set_sens [0-6]\r\n"
+    else:
+        # No level specified, use default
+        set_imu_sensitivity(IMU_DEFAULT_SENSITIVITY)
+        response = "IMU sensitivity set to default (level 2)\r\n"
+    return response
+
+def handle_ble_cmd_set_wakeup_sens(sens_ref):
+    # Command: set_wakeup_sens [0-6] or set_wakeup_sens (defaults to WAKEUP_IMU_SENSITIVITY)
+    response = ""
+    global current_wakeup_sensitivity
+    parts = sens_ref.split()
+    if len(parts) > 1:
+        try:
+            level = int(parts[1])
+            if 0 <= level <= 6:
+                sens_levels = [IMU_SENSITIVITY_LEVEL_0, IMU_SENSITIVITY_LEVEL_1, IMU_SENSITIVITY_LEVEL_2, IMU_SENSITIVITY_LEVEL_3, IMU_SENSITIVITY_LEVEL_4, IMU_SENSITIVITY_LEVEL_5, IMU_SENSITIVITY_LEVEL_6]
+                current_wakeup_sensitivity = sens_levels[level]
+                response = f"Wake-up sensitivity set to level {level}\r\n"
+            else:
+                response = "Error: Sensitivity level must be 0-6\r\n"
+        except ValueError:
+            response = "Error: Invalid sensitivity level. Use: set_wakeup_sens [0-6]\r\n"
+    else:
+        # No level specified, use default
+        current_wakeup_sensitivity = WAKEUP_IMU_SENSITIVITY
+        response = "Wake-up sensitivity set to default (level 4)\r\n"
+    return response
+
+def handle_ble_cmd_set_recording_freq(freq_ref):
+    """ Command: set_recording_freq [1-10] or set_recording_freq (defaults to RECORDING_FREQUENCY) """
+    response = ""
+    global current_recording_frequency
+    parts = freq_ref.split()
+    if len(parts) > 1:
+        try:
+            freq = int(parts[1])
+            if 1 <= freq <= 10:
+                current_recording_frequency = freq
+                response = f"Recording frequency set to {freq} Hz\r\n"
+            else:
+                response = "Error: Recording frequency must be 1-10 Hz\r\n"
+        except ValueError:
+            response = "Error: Invalid frequency. Use: set_recording_freq [1-10]\r\n"
+    else:
+        # No frequency specified, use default
+        current_recording_frequency = RECORDING_FREQUENCY
+        response = f"Recording frequency set to default ({RECORDING_FREQUENCY} Hz)\r\n"
+    return response
+
+def save_to_disk(records):
+    """Helper to save records to disk, trying binary first if enabled."""
+    success = True
+    if SAVE_TO_BIN:
+        success = success and save_to_binfile(records, BINARY_FILE)
+    if SAVE_TO_TXT:
+        success = success and save_to_textfile(records, CSV_FILE)
+    else:
+        DEBUG and print("No saving method enabled. Data kept in RAM only.")
+        return False
+    return success
+
 # --- Main Logic ---
 # Simple continuous recording with BLE control
-DEBUG and print("Starting IMU Data Logger...")
+DEBUG and print("Starting...")
 
 # Check for wake-up alarms (indicates device woke from sleep)
 if alarm.wake_alarm:
@@ -685,7 +833,14 @@ ble.start_advertising(advertisement)
 DEBUG and print("BLE advertising started.")
 
 # Print system status on boot
-DEBUG and print(get_status_info())
+if DEBUG:
+    print(get_status_info())
+    imu_status = read_imu_status()
+    print(f"--- IMU STATUS ---")
+    print(f"Frequency Reg (0x10): {imu_status['frequency_bits']:#04x} (Level {imu_status['frequency_bits']})")
+    print(f"General Sensitivity:  {imu_status['sensitivity_bits']:#04x} (Level {imu_status['sensitivity_scale']})")
+    print(f"Wake-up Threshold:    {imu_status['wake_sensitivity']}")
+    print(f"------------------\n")
 
 # Blink LED 3 times on startup
 blink_led(LED_GREEN, 1, 1)
@@ -723,7 +878,7 @@ while True:
         # Auto-save to file every N records
         if len(unsaved_records) >= AUTO_SAVE_RECORDS_INTERVAL:
             DEBUG and print(f"Auto-saving records to file...")
-            if save_to_file(unsaved_records):
+            if save_to_disk(unsaved_records):
                 # Successfully saved, clear buffer
                 unsaved_records.clear()
 
@@ -732,9 +887,9 @@ while True:
             # If memory allocation error, try to save what we have and clear buffer
             DEBUG and print(f"MemoryError: Attempting to save unsaved records before clearing buffer...")
             try:
-                save_to_file(unsaved_records)
+                save_to_disk(unsaved_records)
             except Exception as save_e:
-                DEBUG and print(f"Error saving to file during MemoryError handling: {save_e}")
+                DEBUG and print(f"Error saving to disk during MemoryError handling: {save_e}")
             # Flush the buffer no matter what
             unsaved_records.clear()
         else:
