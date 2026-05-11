@@ -1,6 +1,3 @@
-# SPDX-FileCopyrightText: 2024 Your Name
-# SPDX-License-Identifier: MIT
-
 """
 IMU Data Logger for Seeed Studio XIAO nRF52840 Sense
 
