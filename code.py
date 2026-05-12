@@ -70,6 +70,7 @@ DEBUG = True                                            # Set to True to enable 
 RECORDING_FREQUENCY         = 10                        # Hz. Rate to sample IMU data.
 AUTO_SAVE_RECORDS_INTERVAL  = 10000                     # Save to file every N records.
 BINARY_FILE                 = "imu_data.bin"            # Binary file for optimized storage (not human-readable)
+MARKS_FILE                  = "marks.csv"               # CSV file for timestamped marks/annotations
 SAVE_TO_DISK                = False                     # Set to True to save records to disk
 IMU_DEFAULT_SENSITIVITY     = IMU_SENSITIVITY_LEVEL_1   # Default sensitivity for general motion detection
 IMU_DEFAULT_FREQUENCY       = IMU_FREQUENCY_LEVEL_3     # Default frequency for wake-up detection
@@ -459,7 +460,7 @@ def read_binary_records(binary_file):
         return []
 
 
-def SAVE_TO_DISKfile(records, binary_file):
+def save_to_disk(records, binary_file):
     """
     Save records to optimized binary format for compact storage.
     Binary format: each record is 12 bytes (3 x float32)
@@ -579,12 +580,14 @@ def handle_ble_commands():
                 response = handle_ble_cmd_set_wakeup_sens(text)
             elif text.startswith('set_recording_freq'):
                 response = handle_ble_cmd_set_recording_freq(text)
+            elif text.startswith('mark'):
+                response = handle_ble_cmd_set_mark(text)
             elif text.startswith('set_time'):
                 response = set_time(text)
             elif text == 'status':
                 response = get_status_info()
             else:
-                response = "Commands: data, clear_buff, clear_data, sensors, status, sleep, set_freq [1-5], set_sens [0-6], set_wakeup_sens [0-6], set_recording_freq [1-10], set_time\r\n"
+                response = "Commands: data, clear_buff, clear_data, sensors, status, sleep, set_freq [1-5], set_sens [0-6], set_wakeup_sens [0-6], set_recording_freq [1-10], mark <value>, set_time\r\n"
             
             if response:
                 DEBUG and print(f"TX: {response.strip()}")
@@ -613,7 +616,7 @@ def handle_ble_cmd_save_buff():
     try:
         if unsaved_records:
             print(f"Saving {len(unsaved_records)} binary records before clear...")
-            SAVE_TO_DISKfile(unsaved_records, BINARY_FILE)
+            save_to_disk(unsaved_records, BINARY_FILE)
             response = True
             unsaved_records.clear()
     except Exception as e:
@@ -720,6 +723,26 @@ def handle_ble_cmd_set_recording_freq(freq_ref):
         response = f"Recording frequency set to default ({RECORDING_FREQUENCY} Hz)\r\n"
     return response
 
+def handle_ble_cmd_set_mark(cmd):
+    """ Command: mark <mark_string> - Save timestamped mark to marks.csv """
+    response = ""
+    parts = cmd.split(None, 1)  # Split into at most 2 parts to preserve spaces in mark value
+    if len(parts) > 1:
+        mark_value = parts[1]
+        try:
+            timestamp = time.monotonic()
+            # Append to marks.csv with timestamp and mark value
+            with open(MARKS_FILE, "a") as f:
+                f.write(str(timestamp) + "," + mark_value + "\r\n")
+            response = "Mark saved: " + mark_value + "\r\n"
+            DEBUG and print("Mark saved at " + str(timestamp) + ": " + mark_value)
+        except OSError as e:
+            response = "Error saving mark: " + str(e) + "\r\n"
+            DEBUG and print("Error saving mark: " + str(e))
+    else:
+        response = "Error: mark requires a value. Use: mark <mark_string>\r\n"
+    return response
+
 
 # --- Main Logic ---
 # Simple continuous recording with BLE control
@@ -771,29 +794,27 @@ while True:
     # Record IMU data continuously
     try:
         imu_data = read_imu()
+        timestamp = time.monotonic()
+        accel_mag = imu_data["accel_mag"]
+        gyro_mag = imu_data["gyro_mag"]
 
-        # Format text for broadcasting and logging
-        last_imu_text = "{:.2f},{:.2f},{:.2f}\n".format(
-            time.monotonic(),
-            imu_data["accel_mag"],
-            imu_data["gyro_mag"]
+        # Format text for broadcasting (accel and gyro only, no timestamp)
+        last_imu_text = "{:.2f},{:.2f}\n".format(
+            accel_mag,
+            gyro_mag
         )
         
-        # Store as binary (12 bytes: 3 × float32)
-        parts = last_imu_text.strip().split(',')
-        timestamp = float(parts[0])
-        accel_mag = float(parts[1])
-        gyro_mag = float(parts[2])
+        # Store as binary (12 bytes: 3 × float32 with timestamp)
         binary_data = struct.pack('<fff', timestamp, accel_mag, gyro_mag)
         unsaved_records.append(binary_data)
         
-        DEBUG and print(f"Recorded: {last_imu_text.strip()}")
-        uart_server.write(last_imu_text.strip().encode())
+        # DEBUG and print(f"Recorded: {last_imu_text.strip()}")
+        uart_server.write(last_imu_text.encode())
 
         # Auto-save to binary file every N records
         if len(unsaved_records) >= AUTO_SAVE_RECORDS_INTERVAL:
             DEBUG and print(f"Auto-saving {len(unsaved_records)} records to binary file...")
-            if SAVE_TO_DISKfile(unsaved_records, BINARY_FILE):
+            if save_to_disk(unsaved_records, BINARY_FILE):
                 # Successfully saved, clear buffer
                 unsaved_records.clear()
 
@@ -802,7 +823,7 @@ while True:
             # If memory allocation error, try to save what we have and clear buffer
             DEBUG and print(f"MemoryError: Attempting to save unsaved records before clearing buffer...")
             try:
-                SAVE_TO_DISKfile(unsaved_records, BINARY_FILE)
+                save_to_disk(unsaved_records, BINARY_FILE)
             except Exception as save_e:
                 DEBUG and print(f"Error saving to disk during MemoryError handling: {save_e}")
             # Flush the buffer no matter what
