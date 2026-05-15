@@ -115,6 +115,7 @@ sensor          = LSM6DS3TRC(imu_i2c)
 ble = BLERadio()
 uart_server = UARTService()
 
+current_save_to_disk            = SAVE_TO_DISK
 current_wakeup_sensitivity      = WAKEUP_IMU_SENSITIVITY    # Track current wake-up sensitivity level
 current_recording_frequency     = RECORDING_FREQUENCY       # Track current recording frequency in Hz
 current_imu_frequency_level     = IMU_DEFAULT_FREQUENCY     # Track current IMU frequency level
@@ -122,6 +123,10 @@ current_imu_sensitivity_level   = IMU_DEFAULT_SENSITIVITY   # Track current IMU 
 last_imu_text                   = ""                        # Last IMU reading as text for broadcasting
 
 # --- Functions ---
+
+# ============================================================================
+# IMU Register Operations (Low-Level I2C)
+# ============================================================================
 
 def write_reg(register, value):
     """Helper to write to LSM6DS3TR-C registers (Default Address 0x6A)"""
@@ -137,6 +142,11 @@ def read_reg(reg):
         # Write register address, then read 1 byte
         device.write_then_readinto(bytes([reg]), result)
     return result[0]
+
+
+# ============================================================================
+# IMU Data & Sensor Configuration
+# ============================================================================
 
 def read_imu():
     """Read the IMU data and compute magnitudes."""
@@ -154,39 +164,29 @@ def read_imu():
         "temp": temp,
     }
 
-def get_free_space_bytes():
-    """Returns the free space in bytes on the filesystem."""
-    s = os.statvfs('/')
-    return s[0] * s[3]
+def read_imu_status():
+    # Read the two core registers
+    reg_10 = read_reg(0x10)  # Frequency and General Sensitivity
+    reg_5B = read_reg(0x5B)  # Wake-up Threshold
 
-def get_ram_info():
-    """Returns total and free SRAM in bytes."""
-    gc.collect()
-    free = gc.mem_free()
-    alloc = gc.mem_alloc()
-    total = free + alloc
-    return total, free
-
-def blink_led(led, num_blinks, delay=0.2):
-    """
-    Blink the built-in LED a specified number of times.
-    Args:
-        led (DigitalInOut): The LED to blink (e.g., LED_RED, LED_GREEN, LED_BLUE)
-        num_blinks (int): Number of times to blink the LED
-        delay (float): Delay in seconds between LED on and off states
-    """
-    if led is None:
-        DEBUG and print("LED not available")
-        return
+    # 1. Frequency (Top 4 bits of 0x10)
+    freq_val = (reg_10 >> 4)
     
-    try:
-        for _ in range(num_blinks):
-            led.value = False # LED on
-            time.sleep(delay)
-            led.value = True  # LED off
-            time.sleep(delay)
-    except Exception as e:
-        DEBUG and print(f"Error blinking LED: {e}")
+    # 2. General Sensitivity / Scale (Bits 3 and 2 of 0x10)
+    # 00 = 2g, 01 = 16g, 10 = 4g, 11 = 8g
+    scale_bits = (reg_10 >> 2) & 0x03
+    scales = {0: "±2g", 1: "±16g", 2: "±4g", 3: "±8g"}
+    current_scale = scales.get(scale_bits, "Unknown")
+
+    # 3. Wake-up Sensitivity (Register 0x5B)
+    wake_sens = reg_5B & 0x3F # Mask to 6 bits
+
+    return {
+        "frequency_bits": freq_val,
+        "sensitivity_bits": scale_bits,
+        "sensitivity_scale": current_scale,
+        "wake_sensitivity": wake_sens,
+    }
 
 def set_imu_wakeup_motion_detection(sensitivity_level=WAKEUP_IMU_SENSITIVITY, frequency_level=IMU_SLEEP_FREQUENCY):
     """
@@ -211,7 +211,6 @@ def set_imu_wakeup_motion_detection(sensitivity_level=WAKEUP_IMU_SENSITIVITY, fr
         DEBUG and print(f"Hardware config failed: {e}")
         return False
 
-
 def set_imu_sensitivity(sensitivity_level):
     """
     Use predefined constants: SENSITIVITY_LEVEL_1, SENSITIVITY_LEVEL_2, etc.)
@@ -235,54 +234,50 @@ def clear_imu_interrupt():
     except Exception as e:
         DEBUG and print(f"Failed to clear interrupt: {e}")
 
-def enter_sleep_mode():
-    """Puts the device into light sleep mode and configures wake-up on motion detection."""
-    set_imu_wakeup_motion_detection(sensitivity_level=current_wakeup_sensitivity)
-    while True:
-        hits = 0
-        start_time = None
-        
-        DEBUG and print(f"Waiting for {WAKEUP_REQUIRED_HITS} motion events...")
 
-        while hits < WAKEUP_REQUIRED_HITS:
-            # 1. Clear latch so the pin can transition again
-            clear_imu_interrupt()
+# ============================================================================
+# LED Control
+# ============================================================================
 
-            # 2. Power off flash to save energy during sleep
-            poweroff_flash()
-            
-            # 3. Sleep until the NEXT motion event
-            motion_alarm = alarm.pin.PinAlarm(pin=board.IMU_INT1, value=True)
-            alarm.light_sleep_until_alarms(motion_alarm)
-            
-            # 4. Handle the hit
-            now = time.monotonic()
-            if hits == 0:
-                # This is the first hit, start the timer window
-                start_time = now
-                hits = 1
-                DEBUG and print("Hit 1/{} detected. Timer started.".format(WAKEUP_REQUIRED_HITS))
-            else:
-                # Check if we are still within the time window
-                if now - start_time <= WAKEUP_WINDOW_SECONDS:
-                    hits += 1
-                    DEBUG and print("Hit {}/{} detected.".format(hits, WAKEUP_REQUIRED_HITS))
-                else:
-                    # Window expired; reset and treat this as the new "first" hit
-                    print("Window expired. Resetting count.")
-                    start_time = now
-                    hits = 1
-        
-        # If we exit the inner while loop, we hit our 'N' count
-        DEBUG and print("MOTION CONFIRMED: {} hits in {}s".format(hits, WAKEUP_WINDOW_SECONDS))
-        DEBUG and blink_led(LED_BLUE, 3, 0.1)  # Indicate wake-up with LED pattern
-        
-        clear_imu_interrupt()
-        set_imu_frequency(current_imu_frequency_level)        # Restore normal frequency
-        set_imu_sensitivity(current_imu_sensitivity_level)    # Restore normal sensitivity
+def blink_led(led, num_blinks, delay=0.2):
+    """
+    Blink the built-in LED a specified number of times.
+    Args:
+        led (DigitalInOut): The LED to blink (e.g., LED_RED, LED_GREEN, LED_BLUE)
+        num_blinks (int): Number of times to blink the LED
+        delay (float): Delay in seconds between LED on and off states
+    """
+    if led is None:
+        DEBUG and print("LED not available")
+        return
+    
+    try:
+        for _ in range(num_blinks):
+            led.value = False # LED on
+            time.sleep(delay)
+            led.value = True  # LED off
+            time.sleep(delay)
+    except Exception as e:
+        DEBUG and print(f"Error blinking LED: {e}")
 
-        break # Fully wake up and continue code.py
-   
+
+# ============================================================================
+# System Information & Monitoring
+# ============================================================================
+
+def get_free_space_bytes():
+    """Returns the free space in bytes on the filesystem."""
+    s = os.statvfs('/')
+    return s[0] * s[3]
+
+def get_ram_info():
+    """Returns total and free SRAM in bytes."""
+    gc.collect()
+    free = gc.mem_free()
+    alloc = gc.mem_alloc()
+    total = free + alloc
+    return total, free
+
 def get_flash_info():
     """Returns total and free Internal Flash (QSPI) in bytes."""
     try:
@@ -297,22 +292,18 @@ def get_flash_info():
         print(f"Error getting flash info: {e}")
         return 0, 0
 
-def poweroff_flash():
+def is_battery_safe():
     """
-    Manages the SPI Flash chip power state.
-    Note: 
-    - CircuitPython 10.x requires all files to be closed for the flash to actually enter low-power mode during sleep.
-    - To "Wake" the flash, the system usually handles this when you attempt a filesystem operation.
+    Checks if voltage is high enough for safe flash writing.
+    3.5V is a safe 'low battery' threshold to prevent corruption.
     """
     try:
-        # 1. Force the system to flush any pending data to the disk
-        storage.remount("/", readonly=False)
-        # 2. On many nRF boards, this is the command to tell the flash to enter Deep Power Down.
-        microcontroller.nvm.view = microcontroller.nvm.view # dummy access
-    except:
-        pass
-    # Note: The flash chip automatically enters Deep Power Down 
-    # during light_sleep() if no files are currently open.
+        with Battery() as bat:
+                voltage = bat.voltage
+                return voltage > BATTERY_SAFETY_THRESHOLD
+    except Exception as e:
+        DEBUG and print(f"Error reading battery: {e}")
+        return False
 
 def get_status_info():
     total_ram, free_ram = get_ram_info()
@@ -359,43 +350,10 @@ def get_status_info():
     )
     return response
 
-def read_imu_status():
-    # Read the two core registers
-    reg_10 = read_reg(0x10)  # Frequency and General Sensitivity
-    reg_5B = read_reg(0x5B)  # Wake-up Threshold
 
-    # 1. Frequency (Top 4 bits of 0x10)
-    freq_val = (reg_10 >> 4)
-    
-    # 2. General Sensitivity / Scale (Bits 3 and 2 of 0x10)
-    # 00 = 2g, 01 = 16g, 10 = 4g, 11 = 8g
-    scale_bits = (reg_10 >> 2) & 0x03
-    scales = {0: "±2g", 1: "±16g", 2: "±4g", 3: "±8g"}
-    current_scale = scales.get(scale_bits, "Unknown")
-
-    # 3. Wake-up Sensitivity (Register 0x5B)
-    wake_sens = reg_5B & 0x3F # Mask to 6 bits
-
-    return {
-        "frequency_bits": freq_val,
-        "sensitivity_bits": scale_bits,
-        "sensitivity_scale": current_scale,
-        "wake_sensitivity": wake_sens,
-    }
-
-
-def is_battery_safe():
-    """
-    Checks if voltage is high enough for safe flash writing.
-    3.5V is a safe 'low battery' threshold to prevent corruption.
-    """
-    try:
-        with Battery() as bat:
-                voltage = bat.voltage
-                return voltage > BATTERY_SAFETY_THRESHOLD
-    except Exception as e:
-        DEBUG and print(f"Error reading battery: {e}")
-        return False
+# ============================================================================
+# Data Storage & File Operations
+# ============================================================================
 
 def has_enough_space_for_record(data_length_bytes):
     """
@@ -459,7 +417,6 @@ def read_binary_records(binary_file):
         DEBUG and print(f"Error reading binary file '{binary_file}': {e}")
         return []
 
-
 def save_to_disk(records, binary_file):
     """
     Save records to optimized binary format for compact storage.
@@ -477,7 +434,7 @@ def save_to_disk(records, binary_file):
     Returns:
         bool: True if records were saved successfully, False otherwise.
     """
-    if not records or not is_battery_safe():
+    if not current_save_to_disk or not records or not is_battery_safe():
         if not is_battery_safe():
             DEBUG and print("Battery voltage too low for safe binary file writing.")
             blink_led(LED_RED, 3, 0.1)
@@ -516,7 +473,79 @@ def save_to_disk(records, binary_file):
         return False
 
 
-# CSV support has been removed - all data is stored in binary format
+# ============================================================================
+# Power Management
+# ============================================================================
+
+def enter_sleep_mode():
+    """Puts the device into light sleep mode and configures wake-up on motion detection."""
+    set_imu_wakeup_motion_detection(sensitivity_level=current_wakeup_sensitivity)
+    while True:
+        hits = 0
+        start_time = None
+        
+        DEBUG and print(f"Waiting for {WAKEUP_REQUIRED_HITS} motion events...")
+
+        while hits < WAKEUP_REQUIRED_HITS:
+            # 1. Clear latch so the pin can transition again
+            clear_imu_interrupt()
+
+            # 2. Power off flash to save energy during sleep
+            poweroff_flash()
+            
+            # 3. Sleep until the NEXT motion event
+            motion_alarm = alarm.pin.PinAlarm(pin=board.IMU_INT1, value=True)
+            alarm.light_sleep_until_alarms(motion_alarm)
+            
+            # 4. Handle the hit
+            now = time.monotonic()
+            if hits == 0:
+                # This is the first hit, start the timer window
+                start_time = now
+                hits = 1
+                DEBUG and print("Hit 1/{} detected. Timer started.".format(WAKEUP_REQUIRED_HITS))
+            else:
+                # Check if we are still within the time window
+                if now - start_time <= WAKEUP_WINDOW_SECONDS:
+                    hits += 1
+                    DEBUG and print("Hit {}/{} detected.".format(hits, WAKEUP_REQUIRED_HITS))
+                else:
+                    # Window expired; reset and treat this as the new "first" hit
+                    print("Window expired. Resetting count.")
+                    start_time = now
+                    hits = 1
+        
+        # If we exit the inner while loop, we hit our 'N' count
+        DEBUG and print("MOTION CONFIRMED: {} hits in {}s".format(hits, WAKEUP_WINDOW_SECONDS))
+        DEBUG and blink_led(LED_BLUE, 3, 0.1)  # Indicate wake-up with LED pattern
+        
+        clear_imu_interrupt()
+        set_imu_frequency(current_imu_frequency_level)        # Restore normal frequency
+        set_imu_sensitivity(current_imu_sensitivity_level)    # Restore normal sensitivity
+
+        break # Fully wake up and continue code.py
+
+def poweroff_flash():
+    """
+    Manages the SPI Flash chip power state.
+    Note: 
+    - CircuitPython 10.x requires all files to be closed for the flash to actually enter low-power mode during sleep.
+    - To "Wake" the flash, the system usually handles this when you attempt a filesystem operation.
+    """
+    try:
+        # 1. Force the system to flush any pending data to the disk
+        storage.remount("/", readonly=False)
+        # 2. On many nRF boards, this is the command to tell the flash to enter Deep Power Down.
+        microcontroller.nvm.view = microcontroller.nvm.view # dummy access
+    except:
+        pass
+    # Note: The flash chip automatically enters Deep Power Down 
+    # during light_sleep() if no files are currently open.
+
+
+# ============================================================================
+# Time Management
+# ============================================================================
 
 def set_time(cmd):
     """
@@ -551,7 +580,14 @@ def set_time(cmd):
     except Exception as e:
         return f"Error setting time: {e}\r\n"
 
+
+# ============================================================================
+# BLE Command Handlers
+# ============================================================================
+
 def handle_ble_commands():
+
+    global current_save_to_disk
     """
     BLE command handler. Processes any pending UART data.
     """
@@ -586,8 +622,10 @@ def handle_ble_commands():
                 response = set_time(text)
             elif text == 'status':
                 response = get_status_info()
+            elif text.startswith('save_to_disk'):
+                response = handle_ble_cmd_set_to_disk(text)
             else:
-                response = "Commands: data, clear_buff, clear_data, sensors, status, sleep, set_freq [1-5], set_sens [0-6], set_wakeup_sens [0-6], set_recording_freq [1-10], mark <value>, set_time\r\n"
+                response = "Commands: data, clear_buff, clear_data, sensors, status, sleep, set_freq [1-5], set_sens [0-6], set_wakeup_sens [0-6], set_recording_freq [1-10], mark <value>, set_time, save_to_disk on/off\r\n"
             
             if response:
                 DEBUG and print(f"TX: {response.strip()}")
@@ -595,6 +633,15 @@ def handle_ble_commands():
         except Exception as e:
             DEBUG and print(f"Error in BLE handler: {e}")
 
+def handle_ble_cmd_set_to_disk(cmd):
+    """Command: save_to_disk on/off"""
+    global current_save_to_disk
+    if cmd.endswith('on'):
+        current_save_to_disk = True
+    elif cmd.endswith('off'):
+        current_save_to_disk = False
+    response = f"Save to disk set to {current_save_to_disk}\r\n"
+    return response
 
 def handle_ble_cmd_data():
     """ Send all data from binary file via BLE in text format """
