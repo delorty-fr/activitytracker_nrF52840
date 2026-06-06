@@ -23,6 +23,7 @@ import rtc
 import struct
 import gc
 import storage
+import json
 from adafruit_lsm6ds import Rate, AccelRange, GyroRange
 from adafruit_lsm6ds.lsm6ds3trc import LSM6DS3TRC
 from seeed_xiao_nrf52840 import Battery
@@ -67,20 +68,42 @@ IMU_FREQUENCY_LEVELS = [
 # --- Config ---
 DEBUG = True                                            # Set to True to enable print statements
 
-RECORDING_FREQUENCY         = 10                        # Hz. Rate to sample IMU data.
-AUTO_SAVE_RECORDS_INTERVAL  = 10000                     # Save to file every N records.
+RECORDING_FREQUENCY         = 5                         # Hz. Rate to sample IMU data.
+AUTO_SAVE_RECORDS_INTERVAL  = 100                       # Save to file every N records.
 BINARY_FILE                 = "imu_data.bin"            # Binary file for optimized storage (not human-readable)
 MARKS_FILE                  = "marks.csv"               # CSV file for timestamped marks/annotations
-SAVE_TO_DISK                = False                     # Set to True to save records to disk
+SAVE_TO_DISK                = True                      # Set to True to save records to disk
 IMU_DEFAULT_SENSITIVITY     = IMU_SENSITIVITY_LEVEL_1   # Default sensitivity for general motion detection
 IMU_DEFAULT_FREQUENCY       = IMU_FREQUENCY_LEVEL_3     # Default frequency for wake-up detection
 WAKEUP_REQUIRED_HITS        = 10                        # 'n' values: Number of triggers needed to fully wake up
 WAKEUP_WINDOW_SECONDS       = 10.0                      # Period to detect those 'n' hits
 WAKEUP_IMU_SENSITIVITY      = IMU_SENSITIVITY_LEVEL_4   # Sensitivity level for wake-up detection
 IMU_SLEEP_FREQUENCY         = IMU_FREQUENCY_LEVEL_2     # Lower frequency during sleep to save power
+EMIT_VALUES                 = False                     # Set to True to emit sensor values using BLE, False otherwise
 
-BATTERY_SAFETY_THRESHOLD    = 3.5                       # Batterry voltage threshold to consider the device safe to operate
+READ_ACCELEROMETER          = True                      # Whether to read accelerometer magnitude values
+READ_GYROSCOPE              = False                     # Whether to read gyroscope magnitude values
+READ_BATTERY                = False                     # Whether to read battery voltage values
+
+BATTERY_SAFETY_THRESHOLD    = 3.3                       # Batterry voltage threshold to consider the device safe to operate
 MIN_DISK_BUFFER_BYTES       = 1024 * 5                  # Min free disk space to keep
+
+# --- High-Resolution Timer Configuration ---
+# Hardware monotonic clock for microsecond-precision timestamps (always enabled)
+TIMER_CALIBRATION_INTERVAL  = 3600                      # Recalibrate monotonic vs RTC every N seconds (1 hour)
+
+# --- Dynamic Binary Formatting ---
+# Calculate expected byte size based on active flags (4 bytes per float32)
+RECORD_PACK_FORMAT = '<f'  # Always include timestamp
+if READ_ACCELEROMETER:
+    RECORD_PACK_FORMAT += 'f'
+if READ_GYROSCOPE:
+    RECORD_PACK_FORMAT += 'f'
+if READ_BATTERY:
+    RECORD_PACK_FORMAT += 'f'
+
+RECORD_SIZE = struct.calcsize(RECORD_PACK_FORMAT)
+
 # --- LEDS ---
 # LED logic is inverted on this board (True = off, False = on)
 LED_RED     = digitalio.DigitalInOut(board.LED_RED)
@@ -110,6 +133,13 @@ imu_i2c         = busio.I2C(board.IMU_SCL, board.IMU_SDA)
 imu_device      = I2CDevice(imu_i2c, 0x6A)
 sensor          = LSM6DS3TRC(imu_i2c)
 
+# Turn off the gyroscope completely
+if not READ_GYROSCOPE:
+    sensor.gyro_data_rate = 0  # 0 Hz completely powers down the gyro circuitry
+
+if not READ_ACCELEROMETER:
+    sensor.accelerometer_data_rate = 0  # 0 Hz completely powers down the accelerometer circuitry
+
 # --- Globals ---
 
 ble = BLERadio()
@@ -120,7 +150,9 @@ current_wakeup_sensitivity      = WAKEUP_IMU_SENSITIVITY    # Track current wake
 current_recording_frequency     = RECORDING_FREQUENCY       # Track current recording frequency in Hz
 current_imu_frequency_level     = IMU_DEFAULT_FREQUENCY     # Track current IMU frequency level
 current_imu_sensitivity_level   = IMU_DEFAULT_SENSITIVITY   # Track current IMU sensitivity level
+current_emit_values             = False                     # Whether to emit sensor values in BLE status command
 last_imu_text                   = ""                        # Last IMU reading as text for broadcasting
+
 
 # --- Functions ---
 
@@ -149,19 +181,30 @@ def read_reg(reg):
 # ============================================================================
 
 def read_imu():
-    """Read the IMU data and compute magnitudes."""
-    accel_x, accel_y, accel_z = sensor.acceleration
-    gyro_x, gyro_y, gyro_z = sensor.gyro
-    temp = sensor.temperature
+    """Read the IMU data and compute magnitudes, plus battery voltage if enabled."""
+    accel_mag = 0.0
+    if READ_ACCELEROMETER:
+        accel_x, accel_y, accel_z = sensor.acceleration
+        accel_mag = (accel_x**2 + accel_y**2 + accel_z**2)**0.5
     
-    # Compute magnitudes
-    accel_mag = (accel_x**2 + accel_y**2 + accel_z**2)**0.5
-    gyro_mag = (gyro_x**2 + gyro_y**2 + gyro_z**2)**0.5
+    gyro_mag = 0.0
+    if READ_GYROSCOPE:
+        gyro_x, gyro_y, gyro_z = sensor.gyro
+        gyro_mag = (gyro_x**2 + gyro_y**2 + gyro_z**2)**0.5
+    
+    battery_voltage = 0.0
+    if READ_BATTERY:
+        try:
+            with Battery() as bat:
+                battery_voltage = bat.voltage
+        except Exception as e:
+            DEBUG and print(f"Error reading battery: {e}")
+            battery_voltage = 0.0
     
     return {
         "accel_mag": accel_mag,
         "gyro_mag": gyro_mag,
-        "temp": temp,
+        "battery_voltage": battery_voltage,
     }
 
 def read_imu_status():
@@ -305,50 +348,81 @@ def is_battery_safe():
         DEBUG and print(f"Error reading battery: {e}")
         return False
 
-def get_status_info():
+def get_formatted_time():
+    """Returns the current date and time as a formatted string."""
+    current_time = time.localtime()
+    return "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
+        current_time[0], current_time[1], current_time[2],
+        current_time[3], current_time[4], current_time[5]
+    )
+
+def get_config():
+    # Get current date and time
+    date_time_str = get_formatted_time()
+    
+    imu_status = read_imu_status()  # Read IMU registers for debug output
+
+    response = {
+        "datetime": date_time_str,
+        "imu": {
+            "frequency_bits": imu_status['frequency_bits'],
+            "frequencency_level": current_imu_frequency_level,
+            "sensitivity_scale": imu_status['sensitivity_scale'],
+            "sensitivity_level": current_imu_sensitivity_level,
+            "sensitivity_bits": imu_status['sensitivity_bits'],
+            "wake_sensitivity": imu_status['wake_sensitivity'],
+            "read_accel": READ_ACCELEROMETER,
+            "read_gyro": READ_GYROSCOPE,
+        },
+        "save_to_disk": current_save_to_disk,
+        "emit_values": current_emit_values,
+        "wakeup_sensitivity": current_wakeup_sensitivity,
+        "recording_frequency": current_recording_frequency
+    }
+
+    return json.dumps(response)
+
+
+def get_status():
     total_ram, free_ram = get_ram_info()
     used_ram = total_ram - free_ram
     total_flash, free_flash = get_flash_info()
     used_flash = total_flash - free_flash
     
     # Get current date and time
-    current_time = time.localtime()
-    date_time_str = "{:04d}-{:02d}-{:02d} {:02d}:{:02d}:{:02d}".format(
-        current_time[0], current_time[1], current_time[2],
-        current_time[3], current_time[4], current_time[5]
-    )
-    
-    # Get binary file size safely
-    try:
-        stat_result = os.stat(BINARY_FILE)
-        file_size = stat_result[6]  # Index 6 is file size in CircuitPython tuple
-    except OSError:
-        file_size = 0
+    date_time_str = get_formatted_time()
     
     # Get battery status
-    battery_info = "Battery: N/A"
+    battery_voltage = 0.0
+    vbatt = 0
+    charge_status = "Unknown"
     try:
         with Battery() as bat:
-            voltage = bat.voltage
+            battery_voltage = bat.voltage
+            vbatt = bat.vbatt
             charge_status = "Charged" if bat.charge_status else "Charging"
-            battery_info = f"Battery: {voltage:.2f}V ({charge_status})"
     except Exception as e:
         DEBUG and print(f"Error reading battery: {e}")
     
-    imu_status = read_imu_status()  # Read IMU registers for debug output
+    response = {
+        "datetime": date_time_str,
+        "battery": {
+            "voltage": round(battery_voltage, 2),
+            "vbatt": vbatt,
+            "charge_status": charge_status,
+            "read_battery": READ_BATTERY
+        },
+        "ram": {
+            "used_bytes": used_ram,
+            "total_bytes": total_ram,
+        },
+        "flash": {
+            "used_bytes": used_flash,
+            "total_bytes": total_flash,
+        },
+    }
 
-    response = (
-        f"datetime: {date_time_str}\r\n"
-        f"{battery_info}\r\n"
-        f"SRAM: {used_ram}/{total_ram} bytes ({used_ram/1024:.1f}/{total_ram/1024:.1f} KB) ({100*used_ram//total_ram}% used)\r\n"
-        f"Flash: {used_flash}/{total_flash} bytes ({used_flash/1024:.1f}/{total_flash/1024:.1f} KB) ({100*used_flash//total_flash}% used)\r\n"
-        f"Unsaved records: {len(unsaved_records)}\r\n"
-        f"Record file size: {file_size} bytes\r\n"
-        f"IMU Frequency: {imu_status['frequency_bits']:#04x}\r\n"
-        f"Sensitivity: {imu_status['sensitivity_scale']} ({imu_status['sensitivity_bits']:#04x})\r\n"
-        f"Wake-up Sensitivity: {imu_status['wake_sensitivity']}\r\n"
-    )
-    return response
+    return json.dumps(response)
 
 
 # ============================================================================
@@ -381,58 +455,9 @@ def clear_datafile():
         DEBUG and print(f"Error clearing data file: {e}")
         return False
 
-def read_binary_records(binary_file):
-    """
-    Read records from optimized binary format and return as CSV-like strings.
-    Binary format: each record is 12 bytes (3 x float32)
-      - Bytes 0-3:   timestamp (float)
-      - Bytes 4-7:   accel_magnitude (float)
-      - Bytes 8-11:  gyro_magnitude (float)
-    
-    Args:
-        binary_file (str): Path to binary file to read
-    
-    Returns:
-        list: List of CSV-formatted records, or empty list if file doesn't exist
-    """
-    records = []
-    try:
-        with open(binary_file, "rb") as f:
-            while True:
-                binary_data = f.read(12)  # Read 12 bytes per record
-                if not binary_data or len(binary_data) < 12:
-                    break
-                
-                # Unpack as 3 floats
-                timestamp, accel_mag, gyro_mag = struct.unpack('<fff', binary_data)
-                
-                # Convert back to CSV format
-                csv_line = f"{timestamp:.2f},{accel_mag:.2f},{gyro_mag:.2f}\n"
-                records.append(csv_line)
-        
-        DEBUG and print(f"Read {len(records)} records from {binary_file}")
-        return records
-        
-    except OSError as e:
-        DEBUG and print(f"Error reading binary file '{binary_file}': {e}")
-        return []
-
 def save_to_disk(records, binary_file):
     """
     Save records to optimized binary format for compact storage.
-    Binary format: each record is 12 bytes (3 x float32)
-      - Bytes 0-3:   timestamp (float)
-      - Bytes 4-7:   accel_magnitude (float)
-      - Bytes 8-11:  gyro_magnitude (float)
-    
-    This reduces storage from ~50 bytes/record (CSV) to 12 bytes/record (~75% reduction).
-    
-    Args:
-        records (list): List of binary records as bytes (12 bytes each)
-        binary_file (str): Path to binary output file
-    
-    Returns:
-        bool: True if records were saved successfully, False otherwise.
     """
     if not current_save_to_disk or not records or not is_battery_safe():
         if not is_battery_safe():
@@ -441,8 +466,8 @@ def save_to_disk(records, binary_file):
         return False
     
     try:
-        # Calculate binary size: 12 bytes per record
-        binary_size = len(records) * 12
+        # Calculate binary size dynamically
+        binary_size = len(records) * RECORD_SIZE
         
         # Check if we have enough space
         if not has_enough_space_for_record(binary_size):
@@ -453,16 +478,16 @@ def save_to_disk(records, binary_file):
         with open(binary_file, "ab") as f:
             for binary_data in records:
                 try:
-                    # Records are already binary (12 bytes each)
-                    if isinstance(binary_data, bytes) and len(binary_data) == 12:
+                    # Validate dynamically
+                    if isinstance(binary_data, bytes) and len(binary_data) == RECORD_SIZE:
                         f.write(binary_data)
                     else:
-                        DEBUG and print(f"Error: Invalid record format (expected 12-byte binary, got {len(binary_data)} bytes)")
+                        DEBUG and print(f"Error: Invalid record format (expected {RECORD_SIZE}-byte binary, got {len(binary_data)} bytes)")
                 except Exception as e:
                     DEBUG and print(f"Error writing binary record: {e}")
                     continue
         
-        DEBUG and print(f"Saved {len(records)} binary records to {binary_file} ({binary_size} bytes)")
+        DEBUG and print(f"Saved {len(records)} binary records to {binary_file} ({binary_size} bytes written - {get_free_space_bytes()} bytes free)")
         return True
         
     except OSError as e:
@@ -472,6 +497,73 @@ def save_to_disk(records, binary_file):
             DEBUG and print(f"Error saving binary file: {e}")
         return False
 
+
+def download_bin():
+    
+    DEBUG and print(f"Start uploading sensor data")
+    
+    """ Streams the optimized binary file over BLE with dynamic MTU sizing """
+    global current_emit_values
+    
+    # 1. Pause live emissions so they don't corrupt the raw binary stream
+    was_emitting = current_emit_values
+    current_emit_values = False 
+    
+    # 2. Save any pending RAM data to flash
+    if unsaved_records:
+        save_to_disk(unsaved_records, BINARY_FILE)
+        unsaved_records.clear()
+        
+    # 3. Determine exact file size
+    try:
+        stat_result = os.stat(BINARY_FILE)
+        file_size = stat_result[6]
+    except OSError:
+        file_size = 0
+        
+    # 4. Send protocol header so desktop knows how many bytes to read
+    header = f"START_BIN:{file_size}\n"
+    uart_server.write(header.encode())
+    
+    # Small yield to ensure the header transmits cleanly before the binary flood
+    time.sleep(0.05) 
+    
+    # 5. Stream raw binary data in chunks using dynamic MTU
+    if file_size > 0:
+        try:
+            # Dynamically get the max packet length negotiated with the desktop
+            try:
+                # ble.connections[0] gets the active BLE connection
+                connection = ble.connections[0]
+                # adafruit_ble UART handles some overhead, so we subtract 4 for safety
+                chunk_size = connection.max_packet_length - 4 
+            except Exception:
+                chunk_size = 120 # Safe fallback if MTU cannot be determined
+
+            if DEBUG:
+                print(f"Streaming {file_size} bytes with MTU chunk size: {chunk_size}")
+            
+            with open(BINARY_FILE, "rb") as f:
+                while True:
+                    chunk = f.read(chunk_size) 
+                    if not chunk:
+                        break
+                    
+                    # Write the chunk directly. 
+                    # No time.sleep() needed here; adafruit_ble will block automatically 
+                    # if the hardware buffer is temporarily full.
+                    uart_server.write(chunk)
+                    
+                    DEBUG and print(f"Sent chunck...")
+                    
+        except OSError as e:
+            if DEBUG:
+                print(f"Error reading bin: {e}")
+                
+    # Restore live emissions if they were active
+    current_emit_values = was_emitting
+    DEBUG and print(f"File uploaded.")
+    return "" # Return empty so we don't accidentally send a trailing \r\n
 
 # ============================================================================
 # Power Management
@@ -547,6 +639,58 @@ def poweroff_flash():
 # Time Management
 # ============================================================================
 
+# High-resolution timer state
+# Option A: Store elapsed time (seconds since calibration) instead of absolute timestamps
+# This preserves float32 precision: elapsed times (0.2, 0.4, 0.6s) have full precision,
+# whereas large Unix timestamps lose fractional parts to float32 rounding.
+_timer_state = {
+    "monotonic_reference": None,     # monotonic time at calibration
+    "calibration_time_unix": None,   # Unix timestamp at calibration (for config metadata)
+}
+
+def _calibrate_timer():
+    """Calibrate the monotonic clock against RTC/system time."""
+    try:
+        mono = time.monotonic()
+        unix_time = time.time()  # Get Unix timestamp for config metadata
+        
+        _timer_state["monotonic_reference"] = mono
+        _timer_state["calibration_time_unix"] = unix_time
+        
+        DEBUG and print(f"[Timer] Calibration: Unix time={unix_time:.1f}, Monotonic={mono:.3f}")
+    except Exception as e:
+        DEBUG and print(f"[Timer] Calibration error: {e}")
+
+def get_elapsed_time_since_calibration():
+    """
+    Get elapsed time (in seconds) since calibration with microsecond precision.
+    
+    Returns a small float (0 to 3600) that can be stored as float32 without precision loss.
+    The config metadata stores the absolute calibration time; records use elapsed time.
+    
+    This solves the float32 precision issue:
+    - WRONG: Unix timestamp (1780618496) + fraction (0.2) = precision loss
+    - RIGHT: Elapsed time (0.0, 0.2, 0.4, 0.6) = full precision in float32
+    """
+    # Check if we need calibration (first call or after long pause)
+    if (_timer_state["monotonic_reference"] is None):
+        _calibrate_timer()
+    
+    try:
+        # Return elapsed seconds since calibration
+        # This is a small value (0-3600 per hour) with full float32 precision
+        elapsed = time.monotonic() - _timer_state["monotonic_reference"]
+        
+        # Recalibrate every hour to prevent drift
+        if elapsed > TIMER_CALIBRATION_INTERVAL:
+            _calibrate_timer()
+            elapsed = 0.0  # Reset elapsed after recalibration
+        
+        return elapsed
+    except Exception as e:
+        DEBUG and print(f"[Timer] get_elapsed_time error: {e}")
+        return 0.0
+
 def set_time(cmd):
     """
     Set the RTC time from external command.
@@ -572,6 +716,8 @@ def set_time(cmd):
                 tm = time.struct_time((year, month, day, hour, minute, second, 0, 0, -1))
                 r = rtc.RTC()
                 r.datetime = tm
+                # Recalibrate timer after setting system time
+                _calibrate_timer()
                 return True
             else:
                 return "Error setting time: Invalid date/time format. Use: set_time YYYY-MM-DD HH:MM:SS\r\n"
@@ -598,34 +744,36 @@ def handle_ble_commands():
             DEBUG and print(f"RX: {text}")
             
             response = ""
-            if text == 'data':
-                response = handle_ble_cmd_data()
-            elif text == 'save_buff':
-                response = handle_ble_cmd_save_buff()
+            if text == 'save_buff':
+                response = handle_save_buff()
             elif text == 'clear_data':
                 response = clear_datafile()
-            elif text == 'sensors':
-                response = handle_ble_cmd_sensors()
             elif text == 'sleep':
                 response = enter_sleep_mode()
             elif text.startswith('set_freq'):
-                response = handle_ble_cmd_set_freq(text)
+                response = handle_set_freq(text)
             elif text.startswith('set_sens'):
-                response = handle_ble_cmd_set_sens(text)
+                response = handle_set_sens(text)
             elif text.startswith('set_wakeup_sens'):
-                response = handle_ble_cmd_set_wakeup_sens(text)
+                response = handle_set_wakeup_sens(text)
             elif text.startswith('set_recording_freq'):
-                response = handle_ble_cmd_set_recording_freq(text)
+                response = handle_set_recording_freq(text)
             elif text.startswith('mark'):
-                response = handle_ble_cmd_set_mark(text)
+                response = handle_set_mark(text)
             elif text.startswith('set_time'):
                 response = set_time(text)
+            elif text == 'config':
+                response = get_config()
             elif text == 'status':
-                response = get_status_info()
+                response = get_status()
+            elif text == 'download_bin':
+                response = download_bin()
             elif text.startswith('save_to_disk'):
-                response = handle_ble_cmd_set_to_disk(text)
+                response = handle_set_to_disk(text)
+            elif text.startswith('emit_values'):
+                response = handle_set_emit_values(text)
             else:
-                response = "Commands: data, clear_buff, clear_data, sensors, status, sleep, set_freq [1-5], set_sens [0-6], set_wakeup_sens [0-6], set_recording_freq [1-10], mark <value>, set_time, save_to_disk on/off\r\n"
+                response = "Commands: data, clear_buff, clear_data, sensors, config, status, sleep, set_freq [1-5], set_sens [0-6], set_wakeup_sens [0-6], set_recording_freq [1-10], mark <value>, set_time, save_to_disk on/off, emit_values on/off\r\n"
             
             if response:
                 DEBUG and print(f"TX: {response.strip()}")
@@ -633,7 +781,7 @@ def handle_ble_commands():
         except Exception as e:
             DEBUG and print(f"Error in BLE handler: {e}")
 
-def handle_ble_cmd_set_to_disk(cmd):
+def handle_set_to_disk(cmd):
     """Command: save_to_disk on/off"""
     global current_save_to_disk
     if cmd.endswith('on'):
@@ -643,26 +791,12 @@ def handle_ble_cmd_set_to_disk(cmd):
     response = f"Save to disk set to {current_save_to_disk}\r\n"
     return response
 
-def handle_ble_cmd_data():
-    """ Send all data from binary file via BLE in text format """
-    response = f"--- start\r\n"
-    uart_server.write(response.encode())
-    try:
-        records = read_binary_records(BINARY_FILE)
-        for line in records:
-            uart_server.write(line.encode())
-            time.sleep(0.01)  # Small delay between records
-        response = f"--- end\r\n"
-    except OSError as e:
-        response = f"Error reading file: {e}\r\n"
-    return response
-
-def handle_ble_cmd_save_buff():
+def handle_save_buff():
     """ Save unsaved records to binary file before clearing """
     response = False
     try:
         if unsaved_records:
-            print(f"Saving {len(unsaved_records)} binary records before clear...")
+            DEBUG and print(f"Saving {len(unsaved_records)} binary records before clear...")
             save_to_disk(unsaved_records, BINARY_FILE)
             response = True
             unsaved_records.clear()
@@ -671,22 +805,7 @@ def handle_ble_cmd_save_buff():
         response = f"Error clearing buffer: {e}\r\n"
     return response
 
-def handle_ble_cmd_sensors():
-    """ Read and return current sensor values """
-    response = ""
-    try:
-        d = read_imu()
-        response = (
-            f"CPU Temp: {microcontroller.cpu.temperature} oC\r\n"
-            f"CPU Voltage: {round(microcontroller.cpu.voltage, 1)} volts\r\n"
-            f"Accel Magnitude: {d['accel_mag']:.2f} m/s^2\r\n"
-            f"Gyro Magnitude: {d['gyro_mag']:.2f} rad/s\r\n"
-        )
-    except Exception as e:
-        response = f"Error reading sensors: {e}\r\n"
-    return response
-
-def handle_ble_cmd_set_freq(freq_ref):
+def handle_set_freq(freq_ref):
     """ Command: set_freq [1-5] or set_freq (defaults to IMU_DEFAULT_FREQUENCY) """
     response = ""
     parts = freq_ref.split()
@@ -707,7 +826,7 @@ def handle_ble_cmd_set_freq(freq_ref):
         response = "IMU frequency set to default (level 4)\r\n"
     return response
 
-def handle_ble_cmd_set_sens(sens_ref):
+def handle_set_sens(sens_ref):
     """Command: set_sens [0-6] or set_sens (defaults to IMU_DEFAULT_SENSITIVITY) """
     parts = sens_ref.split()
     if len(parts) > 1:
@@ -727,7 +846,7 @@ def handle_ble_cmd_set_sens(sens_ref):
         response = "IMU sensitivity set to default (level 2)\r\n"
     return response
 
-def handle_ble_cmd_set_wakeup_sens(sens_ref):
+def handle_set_wakeup_sens(sens_ref):
     # Command: set_wakeup_sens [0-6] or set_wakeup_sens (defaults to WAKEUP_IMU_SENSITIVITY)
     response = ""
     global current_wakeup_sensitivity
@@ -749,7 +868,7 @@ def handle_ble_cmd_set_wakeup_sens(sens_ref):
         response = "Wake-up sensitivity set to default (level 4)\r\n"
     return response
 
-def handle_ble_cmd_set_recording_freq(freq_ref):
+def handle_set_recording_freq(freq_ref):
     """ Command: set_recording_freq [1-10] or set_recording_freq (defaults to RECORDING_FREQUENCY) """
     response = ""
     global current_recording_frequency
@@ -770,17 +889,17 @@ def handle_ble_cmd_set_recording_freq(freq_ref):
         response = f"Recording frequency set to default ({RECORDING_FREQUENCY} Hz)\r\n"
     return response
 
-def handle_ble_cmd_set_mark(cmd):
+def handle_set_mark(cmd):
     """ Command: mark <mark_string> - Save timestamped mark to marks.csv """
     response = ""
     parts = cmd.split(None, 1)  # Split into at most 2 parts to preserve spaces in mark value
     if len(parts) > 1:
         mark_value = parts[1]
         try:
-            timestamp = time.monotonic()
-            # Append to marks.csv with timestamp and mark value
+            timestamp = get_high_resolution_timestamp()
+            # Append to marks.csv with timestamp and mark value (format matches data file for synchronization)
             with open(MARKS_FILE, "a") as f:
-                f.write(str(timestamp) + "," + mark_value + "\r\n")
+                f.write(f"{timestamp:.6f}," + mark_value + "\r\n")
             response = "Mark saved: " + mark_value + "\r\n"
             DEBUG and print("Mark saved at " + str(timestamp) + ": " + mark_value)
         except OSError as e:
@@ -790,6 +909,19 @@ def handle_ble_cmd_set_mark(cmd):
         response = "Error: mark requires a value. Use: mark <mark_string>\r\n"
     return response
 
+def handle_set_emit_values(cmd):
+    """ Command: emit_values on/off - Whether to include sensor values in BLE status updates """
+    global current_emit_values
+    response = "current_emit_values set to "
+    if cmd.endswith('on'):
+        current_emit_values = True
+        response += "on\r\n"
+    elif cmd.endswith('off'):
+        current_emit_values = False
+        response += "off\r\n"
+    else:
+        response = "Error: Invalid command. Use: emit_values on/off\r\n"
+    return response
 
 # --- Main Logic ---
 # Simple continuous recording with BLE control
@@ -811,7 +943,7 @@ DEBUG and print("BLE advertising started.")
 
 # Print system status on boot
 if DEBUG:
-    print(get_status_info())
+    print(get_config())
     imu_status = read_imu_status()
     print(f"--- IMU STATUS ---")
     print(f"Frequency Reg (0x10): {imu_status['frequency_bits']:#04x} (Level {imu_status['frequency_bits']})")
@@ -821,6 +953,10 @@ if DEBUG:
 
 # Blink LED 3 times on startup
 blink_led(LED_GREEN, 1, 1)
+
+# Initialize high-resolution timer calibration
+_calibrate_timer()
+DEBUG and print(f"[Timer] Using monotonic clock for high-resolution timestamps (microsecond precision)")
 
 # Main loop: continuously record IMU data
 while True:
@@ -841,22 +977,26 @@ while True:
     # Record IMU data continuously
     try:
         imu_data = read_imu()
-        timestamp = time.monotonic()
+        elapsed_time = get_elapsed_time_since_calibration()
         accel_mag = imu_data["accel_mag"]
         gyro_mag = imu_data["gyro_mag"]
+        battery_voltage = imu_data["battery_voltage"]
 
-        # Format text for broadcasting (accel and gyro only, no timestamp)
-        last_imu_text = "{:.2f},{:.2f}\n".format(
-            accel_mag,
-            gyro_mag
-        )
+        # Store as binary with dynamic fields based on READ_* flags
+        pack_data = [elapsed_time]
         
-        # Store as binary (12 bytes: 3 × float32 with timestamp)
-        binary_data = struct.pack('<fff', timestamp, accel_mag, gyro_mag)
+        if READ_ACCELEROMETER:
+            pack_data.append(accel_mag)
+        
+        if READ_GYROSCOPE:
+            pack_data.append(gyro_mag)
+        
+        if READ_BATTERY:
+            pack_data.append(battery_voltage)
+        
+        # Use the pre-calculated format string
+        binary_data = struct.pack(RECORD_PACK_FORMAT, *pack_data)
         unsaved_records.append(binary_data)
-        
-        # DEBUG and print(f"Recorded: {last_imu_text.strip()}")
-        uart_server.write(last_imu_text.encode())
 
         # Auto-save to binary file every N records
         if len(unsaved_records) >= AUTO_SAVE_RECORDS_INTERVAL:
@@ -864,6 +1004,20 @@ while True:
             if save_to_disk(unsaved_records, BINARY_FILE):
                 # Successfully saved, clear buffer
                 unsaved_records.clear()
+
+        if current_emit_values and ble.connected:
+            # Format text for broadcasting (dynamic based on READ_* flags, no timestamp)
+            values = []
+            if READ_ACCELEROMETER:
+                values.append(f"{accel_mag:.2f}")
+            if READ_GYROSCOPE:
+                values.append(f"{gyro_mag:.2f}")
+            if READ_BATTERY:
+                values.append(f"{battery_voltage:.2f}")
+            
+            last_imu_text = ",".join(values) + "\n"
+            # DEBUG and print(f"Recorded: {last_imu_text.strip()}")
+            uart_server.write(last_imu_text.encode())
 
     except Exception as e:
         if isinstance(e, MemoryError):
@@ -878,21 +1032,9 @@ while True:
         else:
             DEBUG and print(f"Error in main loop: {e}")
     
-    # try:
-    #     # Send status over BLE every 5 iterations
-    #     if DEBUG and iteration_count >= 5 and ble.connected:
-    #         try:
-    #             uart_server.write(get_status_info().encode())
-    #         except Exception as e:
-    #             if DEBUG:
-    #                 print(f"Error sending to BLE: {e}")
-    #         iteration_count = 0
-    # except Exception as e:
-    #     if DEBUG:
-    #         print(f"Error in BLE status update: {e}")
-
     # Handle BLE commands (non-blocking)
     if ble.connected:
         handle_ble_commands()
     
     time.sleep(1 / current_recording_frequency)  # Sample at configured frequency
+

@@ -153,7 +153,6 @@ class Mic(PDMIn):
     def __exit__(self, exc_type, exc_val, exc_tb):
         self.deinit()
 
-
 class Battery:
     """
     Seeed XIAO nRF52840 battery management functions
@@ -186,7 +185,7 @@ class Battery:
         return not self._charge_status.value
 
     @property
-    def voltage(self) -> float:
+    def vbatt(self) -> float:
         """
         Battery voltage in volts
         """
@@ -201,8 +200,16 @@ class Battery:
         # readings, the later ones will be more accurate
         for _i in range(9):
             _ = self._vbat.value
-        value = (self._vbat.value / 65535.0) * self._vbat.reference_voltage * 3.1
+        value = self._vbat.value
         self._read_batt_enable.direction = digitalio.Direction.INPUT
+        return value
+    
+    @property
+    def voltage(self) -> float:
+        """
+        Battery voltage in volts
+        """
+        value = (self.vbatt / 65535.0) * self._vbat.reference_voltage * 3.1
         return value
 
     @property
@@ -242,3 +249,5 @@ class Battery:
 
 __version__ = "1.0.2"
 __repo__ = "https://github.com/furbrain/CircuitPython_seeed_xiao_nRF52840.git"
+
+
